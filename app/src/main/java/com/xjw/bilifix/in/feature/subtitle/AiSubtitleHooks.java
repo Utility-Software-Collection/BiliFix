@@ -5,6 +5,7 @@ import android.net.Uri;
 
 import com.xjw.bilifix.in.core.HookApi;
 import com.xjw.bilifix.in.core.HostApplication;
+import com.xjw.bilifix.in.core.MossHookHub;
 
 import java.lang.reflect.Method;
 import java.util.Collections;
@@ -13,6 +14,8 @@ import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import io.github.libxposed.api.XposedInterface;
+
 /** Enables the host's existing AI subtitle UI by requesting DmView with a supported identity. */
 public final class AiSubtitleHooks {
     private static final String DM_VIEW_METHOD =
@@ -20,6 +23,7 @@ public final class AiSubtitleHooks {
 
     private final HookApi module;
     private final ClassLoader classLoader;
+    private final MossHookHub mossHub;
     private final ThreadLocal<String> requestScope = new ThreadLocal<>();
     private final Map<Object, Boolean> inspectedReplies =
             Collections.synchronizedMap(new WeakHashMap<>());
@@ -27,9 +31,10 @@ public final class AiSubtitleHooks {
     private final AtomicInteger identityLogCount = new AtomicInteger();
     private final AtomicInteger responseLogCount = new AtomicInteger();
 
-    public AiSubtitleHooks(HookApi module, ClassLoader classLoader) {
+    public AiSubtitleHooks(HookApi module, ClassLoader classLoader, MossHookHub mossHub) {
         this.module = module;
         this.classLoader = classLoader;
+        this.mossHub = mossHub;
     }
 
     public void install() {
@@ -41,60 +46,47 @@ public final class AiSubtitleHooks {
 
     private void installMossIdentityHooks() throws Throwable {
         SubtitleRequestIdentity identity = new SubtitleRequestIdentity(module, classLoader);
-        Class<?> metadataFactoryClass = module.load(classLoader, "if1.a");
-        Method createMetadata = module.declaredMethod(metadataFactoryClass, "n");
-        Method createDevice = module.declaredMethod(metadataFactoryClass, "k");
-        Method createFawkes = module.declaredMethod(metadataFactoryClass, "i");
-        module.deoptimizeFeatureMethod(createMetadata);
-        module.deoptimizeFeatureMethod(createDevice);
-        module.deoptimizeFeatureMethod(createFawkes);
-        installIdentityHook(
-                "AI subtitle Moss metadata", createMetadata, identity::rewriteMetadata);
-        installIdentityHook(
-                "AI subtitle Moss device", createDevice, identity::rewriteDevice);
-        installIdentityHook(
-                "AI subtitle Moss Fawkes", createFawkes, identity::preserveFawkes);
-
-        Class<?> descriptorClass = module.load(classLoader, "io.grpc.MethodDescriptor");
-        Class<?> generatedMessageClass = module.load(
-                classLoader, "com.google.protobuf.GeneratedMessageLite");
-        Class<?> responseHandlerClass = module.load(
-                classLoader, "com.bilibili.lib.moss.api.MossResponseHandler");
-        Class<?> httpRuleClass = module.load(
-                classLoader, "com.bilibili.lib.moss.api.MossHttpRule");
-        Class<?> serviceClass = module.load(
-                classLoader, "com.bilibili.lib.moss.api.MossServiceImp");
-        Method descriptorName = module.declaredMethod(descriptorClass, "c");
-        Method asyncUnaryCall = module.declaredMethod(
-                serviceClass, "asyncUnaryCall", descriptorClass, generatedMessageClass,
-                responseHandlerClass, httpRuleClass);
-        Method blockingUnaryCall = module.declaredMethod(
-                serviceClass, "blockingUnaryCall", descriptorClass,
-                generatedMessageClass, httpRuleClass);
-        module.deoptimizeFeatureMethod(asyncUnaryCall);
-        module.deoptimizeFeatureMethod(blockingUnaryCall);
+        registerIdentityRewriter(
+                "AI subtitle Moss metadata", MossHookHub.Factory.METADATA,
+                identity::rewriteMetadata);
+        registerIdentityRewriter(
+                "AI subtitle Moss device", MossHookHub.Factory.DEVICE,
+                identity::rewriteDevice);
+        registerIdentityRewriter(
+                "AI subtitle Moss Fawkes", MossHookHub.Factory.FAWKES,
+                identity::preserveFawkes);
 
         DmViewRequestInspector requestInspector = new DmViewRequestInspector(module, classLoader);
-        installMossCallScope(
-                "AI subtitle async DmView", asyncUnaryCall, descriptorName, requestInspector);
-        installMossCallScope(
-                "AI subtitle blocking DmView", blockingUnaryCall,
-                descriptorName, requestInspector);
-        installMossOkHttpScope();
+        mossHub.addUnaryCallScope(new MossHookHub.UnaryCallScope() {
+            @Override
+            public boolean matches(String fullMethodName) {
+                return isDmView(fullMethodName);
+            }
+
+            @Override
+            public Object around(String fullMethodName, XposedInterface.Chain chain,
+                    Object[] args, MossHookHub.Next next) throws Throwable {
+                module.ensureFeatureSettings(currentApplication());
+                if (!module.isAiSubtitleEnabled()) {
+                    return next.proceed(args);
+                }
+                String source = "Moss " + fullMethodName;
+                logRequest(source, requestInspector.summarize(chain.getArg(1)));
+                return withScope(source, () -> next.proceed(args));
+            }
+        });
+        registerMossOkHttpScope();
     }
 
-    private void installIdentityHook(
-            String label, Method factory, IdentityRewriter rewriter) {
-        module.addHook(label, factory, hookChain -> {
-            Object result = hookChain.proceed();
+    private void registerIdentityRewriter(
+            String label, MossHookHub.Factory factory, IdentityRewriter rewriter) {
+        mossHub.addFactoryRewriter(factory, bytes -> {
             String source = requestScope.get();
-            if (source == null || !module.isAiSubtitleEnabled()
-                    || !(result instanceof byte[])) {
-                return result;
+            if (source == null || !module.isAiSubtitleEnabled()) {
+                return bytes;
             }
             try {
-                SubtitleRequestIdentity.RewriteResult rewritten =
-                        rewriter.rewrite((byte[]) result);
+                SubtitleRequestIdentity.RewriteResult rewritten = rewriter.rewrite(bytes);
                 int sequence = identityLogCount.incrementAndGet();
                 if (shouldSample(sequence, 20, 100)) {
                     module.debug(label + " rewritten: source=" + source
@@ -106,57 +98,30 @@ public final class AiSubtitleHooks {
             } catch (Throwable throwable) {
                 module.error(label + " rewrite failed; original bytes retained: source="
                         + source, throwable);
-                return result;
+                return bytes;
             }
         });
     }
 
-    private void installMossCallScope(
-            String label,
-            Method callMethod,
-            Method descriptorName,
-            DmViewRequestInspector requestInspector) {
-        module.addHook(label, callMethod, hookChain -> {
-            Object descriptor = hookChain.getArg(0);
-            String fullMethodName = String.valueOf(
-                    module.invoke(descriptorName, descriptor));
-            if (!isDmView(fullMethodName)) {
-                return hookChain.proceed();
+    private void registerMossOkHttpScope() {
+        mossHub.addOkHttpScope(MossHookHub.PART_IDENTITY, new MossHookHub.OkHttpScope() {
+            @Override
+            public boolean matches(String url) {
+                return isDmView(url);
             }
-            module.ensureFeatureSettings(currentApplication());
-            if (!module.isAiSubtitleEnabled()) {
-                return hookChain.proceed();
-            }
-            String source = "Moss " + fullMethodName;
-            logRequest(source, requestInspector.summarize(hookChain.getArg(1)));
-            return withScope(source, hookChain::proceed);
-        });
-    }
 
-    private void installMossOkHttpScope() throws Throwable {
-        Class<?> interceptorClass = module.load(classLoader, "cg1.a");
-        Class<?> chainClass = module.load(classLoader, "okhttp3.u$a");
-        Class<?> requestClass = module.load(classLoader, "okhttp3.a0");
-        Method intercept = module.declaredMethod(interceptorClass, "intercept", chainClass);
-        Method getRequest = module.declaredMethod(chainClass, "request");
-        Method getUrl = module.declaredMethod(requestClass, "l");
-        module.deoptimizeFeatureMethod(intercept);
-
-        module.addHook("AI subtitle Moss OkHttp DmView scope", intercept, hookChain -> {
-            Object chain = hookChain.getArg(0);
-            Object request = module.invoke(getRequest, chain);
-            String url = String.valueOf(module.invoke(getUrl, request));
-            if (!isDmView(url)) {
-                return hookChain.proceed();
+            @Override
+            public Object around(String part, String url, XposedInterface.Chain chain,
+                    Object[] args, MossHookHub.Next next) throws Throwable {
+                module.ensureFeatureSettings(currentApplication());
+                if (!module.isAiSubtitleEnabled()) {
+                    return next.proceed(args);
+                }
+                Uri uri = Uri.parse(url);
+                String source = "Moss-OkHttp " + uri.getEncodedPath();
+                logRequest(source, "network-dispatch");
+                return withScope(source, () -> next.proceed(args));
             }
-            module.ensureFeatureSettings(currentApplication());
-            if (!module.isAiSubtitleEnabled()) {
-                return hookChain.proceed();
-            }
-            Uri uri = Uri.parse(url);
-            String source = "Moss-OkHttp " + uri.getEncodedPath();
-            logRequest(source, "network-dispatch");
-            return withScope(source, hookChain::proceed);
         });
     }
 

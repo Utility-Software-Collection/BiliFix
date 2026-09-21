@@ -5,12 +5,15 @@ import android.net.Uri;
 
 import com.xjw.bilifix.in.core.HookApi;
 import com.xjw.bilifix.in.core.HostApplication;
+import com.xjw.bilifix.in.core.RestHookHub;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import io.github.libxposed.api.XposedInterface;
 
 /** Restores paid emoticon packages hidden by the international app's obsolete request identity. */
 public final class PaidEmoticonHooks {
@@ -25,14 +28,16 @@ public final class PaidEmoticonHooks {
 
     private final HookApi module;
     private final ClassLoader classLoader;
+    private final RestHookHub restHub;
     private final ThreadLocal<String> requestScope = new ThreadLocal<>();
     private final AtomicInteger requestLogCount = new AtomicInteger();
     private final AtomicInteger parameterLogCount = new AtomicInteger();
     private final AtomicInteger panelLogCount = new AtomicInteger();
 
-    public PaidEmoticonHooks(HookApi module, ClassLoader classLoader) {
+    public PaidEmoticonHooks(HookApi module, ClassLoader classLoader, RestHookHub restHub) {
         this.module = module;
         this.classLoader = classLoader;
+        this.restHub = restHub;
     }
 
     public void install() {
@@ -41,101 +46,82 @@ public final class PaidEmoticonHooks {
     }
 
     private void installRestIdentityHooks() throws Throwable {
-        Class<?> requestClass = module.load(classLoader, "okhttp3.a0");
-        Class<?> interceptorClass = module.load(classLoader,
-                "com.bilibili.okretro.interceptor.a");
         Class<?> libBiliClass = module.load(classLoader,
                 "com.bilibili.nativelibrary.LibBili");
-        Class<?> configClass = module.load(classLoader, "dc.a");
-
-        Method requestUrl = module.declaredMethod(requestClass, "l");
-        Method requestVerb = module.declaredMethod(requestClass, "h");
-        Method intercept = module.declaredMethod(interceptorClass, "intercept", requestClass);
-        Method addCommonParam = module.declaredMethod(
-                interceptorClass, "addCommonParam", Map.class);
         Method domesticAppKey = module.declaredMethod(libBiliClass, "f", String.class);
-        Method userAgent = module.declaredMethod(configClass, "c");
 
-        module.deoptimizeFeatureMethod(intercept);
-        module.deoptimizeFeatureMethod(addCommonParam);
+        restHub.addRequestScope(new RestHookHub.RequestScope() {
+            @Override
+            public boolean matches(String url, String verb) {
+                return url.contains(EMOTICON_PATH_PREFIX) && isTargetRequest(url, verb);
+            }
 
-        module.addHook("Paid emoticon targeted REST scope", intercept, hookChain -> {
-            Object request = hookChain.getArg(0);
-            String url = String.valueOf(module.invoke(requestUrl, request));
-            String verb = String.valueOf(module.invoke(requestVerb, request));
-            if (!isTargetRequest(url, verb)) {
-                return hookChain.proceed();
+            @Override
+            public Object around(String url, String verb, XposedInterface.Chain chain,
+                    Object[] args, RestHookHub.Next next) throws Throwable {
+                module.ensureFeatureSettings(currentApplication());
+                if (!module.isPaidEmoticonFixEnabled()) {
+                    return next.proceed(args);
+                }
+                Uri uri = Uri.parse(url);
+                String source = verb + " " + uri.getHost() + normalizePath(uri.getEncodedPath());
+                int sequence = requestLogCount.incrementAndGet();
+                if (shouldSample(sequence, 20, 100)) {
+                    module.info("paid emoticon compatible identity enabled: source=" + source
+                            + " identity=" + identity()
+                            + " appkey=derived-from-mobi-app"
+                            + " sample=" + sequence);
+                }
+                return withScope(source, () -> next.proceed(args));
             }
-            module.ensureFeatureSettings(currentApplication());
-            if (!module.isPaidEmoticonFixEnabled()) {
-                return hookChain.proceed();
-            }
-            Uri uri = Uri.parse(url);
-            String source = verb + " " + uri.getHost() + normalizePath(uri.getEncodedPath());
-            int sequence = requestLogCount.incrementAndGet();
-            if (shouldSample(sequence, 20, 100)) {
-                module.info("paid emoticon compatible identity enabled: source=" + source
-                        + " identity=" + identity()
-                        + " appkey=derived-from-mobi-app"
-                        + " sample=" + sequence);
-            }
-            return withScope(source, hookChain::proceed);
         });
 
-        module.addHook("Paid emoticon domestic REST parameters", addCommonParam,
-                hookChain -> {
-                    Object result = hookChain.proceed();
-                    String source = requestScope.get();
-                    if (source == null || !module.isPaidEmoticonFixEnabled()) {
-                        return result;
-                    }
-                    Object value = hookChain.getArg(0);
-                    if (!(value instanceof Map)) {
-                        module.warn("paid emoticon REST parameters unavailable: source="
-                                + source + " value=" + summarize(value));
-                        return result;
-                    }
-                    @SuppressWarnings("unchecked")
-                    Map<Object, Object> parameters = (Map<Object, Object>) value;
-                    Object oldMobiApp = parameters.get("mobi_app");
-                    Object oldBuild = parameters.get("build");
-                    try {
-                        parameters.put("mobi_app", MOBI_APP);
-                        parameters.put("appkey", module.invoke(domesticAppKey, null, MOBI_APP));
-                        parameters.put("build", String.valueOf(BUILD));
-                        parameters.put("channel", CHANNEL);
-                        parameters.put("statistics", STATISTICS);
-                        int sequence = parameterLogCount.incrementAndGet();
-                        if (shouldSample(sequence, 20, 100)) {
-                            module.info("paid emoticon REST parameters rewritten: source=" + source
-                                    + " oldIdentity=" + oldMobiApp + "/" + oldBuild
-                                    + " newIdentity=" + identity()
-                                    + " appkey=derived-from-mobi-app"
-                                    + " sample=" + sequence);
-                        }
-                    } catch (Throwable throwable) {
-                        module.error("paid emoticon REST parameter rewrite failed: source="
-                                + source + " oldIdentity=" + oldMobiApp + "/" + oldBuild,
-                                throwable);
-                    }
-                    return result;
-                });
+        restHub.addCommonParamListener(value -> {
+            String source = requestScope.get();
+            if (source == null || !module.isPaidEmoticonFixEnabled()) {
+                return;
+            }
+            if (!(value instanceof Map)) {
+                module.warn("paid emoticon REST parameters unavailable: source="
+                        + source + " value=" + summarize(value));
+                return;
+            }
+            @SuppressWarnings("unchecked")
+            Map<Object, Object> parameters = (Map<Object, Object>) value;
+            Object oldMobiApp = parameters.get("mobi_app");
+            Object oldBuild = parameters.get("build");
+            try {
+                parameters.put("mobi_app", MOBI_APP);
+                parameters.put("appkey", module.invoke(domesticAppKey, null, MOBI_APP));
+                parameters.put("build", String.valueOf(BUILD));
+                parameters.put("channel", CHANNEL);
+                parameters.put("statistics", STATISTICS);
+                int sequence = parameterLogCount.incrementAndGet();
+                if (shouldSample(sequence, 20, 100)) {
+                    module.info("paid emoticon REST parameters rewritten: source=" + source
+                            + " oldIdentity=" + oldMobiApp + "/" + oldBuild
+                            + " newIdentity=" + identity()
+                            + " appkey=derived-from-mobi-app"
+                            + " sample=" + sequence);
+                }
+            } catch (Throwable throwable) {
+                module.error("paid emoticon REST parameter rewrite failed: source="
+                        + source + " oldIdentity=" + oldMobiApp + "/" + oldBuild,
+                        throwable);
+            }
+        });
 
-        module.addHook("Paid emoticon domestic REST user agent", userAgent,
-                hookChain -> {
-                    Object result = hookChain.proceed();
-                    String source = requestScope.get();
-                    if (source == null || !module.isPaidEmoticonFixEnabled()
-                            || !(result instanceof String)) {
-                        return result;
-                    }
-                    String original = (String) result;
-                    String rewritten = rewriteUserAgent(original);
-                    if (!original.equals(rewritten) && module.isVerboseLoggingEnabled()) {
-                        module.debug("paid emoticon REST user agent rewritten: source=" + source);
-                    }
-                    return rewritten;
-                });
+        restHub.addUserAgentRewriter(original -> {
+            String source = requestScope.get();
+            if (source == null || !module.isPaidEmoticonFixEnabled()) {
+                return original;
+            }
+            String rewritten = rewriteUserAgent(original);
+            if (!original.equals(rewritten) && module.isVerboseLoggingEnabled()) {
+                module.debug("paid emoticon REST user agent rewritten: source=" + source);
+            }
+            return rewritten;
+        });
     }
 
     private void installPanelDiagnostics() throws Throwable {

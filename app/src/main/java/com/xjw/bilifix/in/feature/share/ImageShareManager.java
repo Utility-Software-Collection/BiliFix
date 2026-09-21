@@ -65,6 +65,7 @@ final class ImageShareManager {
             new LinkedHashMap<>(16, 0.75f, true);
     private volatile Method imageCacheLookup;
     private volatile Method fileProviderGetUri;
+    private volatile Object downloadClient;
 
     ImageShareManager(HookApi module, ClassLoader classLoader) {
         this.module = module;
@@ -452,7 +453,7 @@ final class ImageShareManager {
         long startedAt = SystemClock.elapsedRealtime();
         Class<?> clientClass = module.load(classLoader, "okhttp3.y");
         Class<?> requestBuilderClass = module.load(classLoader, "okhttp3.a0$a");
-        Object client = clientClass.getConstructor().newInstance();
+        Object client = downloadClient(clientClass);
         Object requestBuilder = requestBuilderClass.getConstructor().newInstance();
         Method setUrl = findMethod(requestBuilderClass, "p", String.class);
         Method buildRequest = findMethod(requestBuilderClass, "b");
@@ -501,6 +502,20 @@ final class ImageShareManager {
                 deleteQuietly(output);
             }
         }
+    }
+
+    private Object downloadClient(Class<?> clientClass) throws Throwable {
+        Object client = downloadClient;
+        if (client == null) {
+            synchronized (this) {
+                client = downloadClient;
+                if (client == null) {
+                    client = clientClass.getConstructor().newInstance();
+                    downloadClient = client;
+                }
+            }
+        }
+        return client;
     }
 
     private File copyIntoShareCache(Context context, File source, String label)

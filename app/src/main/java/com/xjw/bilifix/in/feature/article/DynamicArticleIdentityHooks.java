@@ -5,6 +5,7 @@ import android.net.Uri;
 
 import com.xjw.bilifix.in.core.HookApi;
 import com.xjw.bilifix.in.core.HostApplication;
+import com.xjw.bilifix.in.core.MossHookHub;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -15,6 +16,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import io.github.libxposed.api.XposedInterface;
 
 /** Restores Opus cards filtered from the legacy client's dynamic feeds. */
 public final class DynamicArticleIdentityHooks {
@@ -37,6 +40,7 @@ public final class DynamicArticleIdentityHooks {
 
     private final HookApi module;
     private final ClassLoader classLoader;
+    private final MossHookHub mossHub;
     private final ThreadLocal<String> requestScope = new ThreadLocal<>();
     private final Map<Object, String> dynamicCallScopes =
             Collections.synchronizedMap(new WeakHashMap<>());
@@ -50,9 +54,11 @@ public final class DynamicArticleIdentityHooks {
     private final AtomicInteger transportRepairLogCount = new AtomicInteger();
     private final AtomicInteger transportIdentityLogCount = new AtomicInteger();
 
-    public DynamicArticleIdentityHooks(HookApi module, ClassLoader classLoader) {
+    public DynamicArticleIdentityHooks(
+            HookApi module, ClassLoader classLoader, MossHookHub mossHub) {
         this.module = module;
         this.classLoader = classLoader;
+        this.mossHub = mossHub;
     }
 
     public void install() {
@@ -205,92 +211,74 @@ public final class DynamicArticleIdentityHooks {
     private void installMossIdentityHooks() throws Throwable {
         DynamicArticleRequestIdentity identity =
                 new DynamicArticleRequestIdentity(module, classLoader);
-        Class<?> metadataFactoryClass = module.load(classLoader, "if1.a");
-        Method createMetadata = module.declaredMethod(metadataFactoryClass, "n");
-        Method createDevice = module.declaredMethod(metadataFactoryClass, "k");
-        Method createFawkes = module.declaredMethod(metadataFactoryClass, "i");
-        module.deoptimizeFeatureMethod(createMetadata);
-        module.deoptimizeFeatureMethod(createDevice);
-        module.deoptimizeFeatureMethod(createFawkes);
-        installIdentityHook(
-                "Dynamic article Moss metadata", createMetadata,
+        registerIdentityRewriter(
+                "Dynamic article Moss metadata", MossHookHub.Factory.METADATA,
                 identity::rewriteMetadata);
-        installIdentityHook(
-                "Dynamic article Moss device", createDevice,
+        registerIdentityRewriter(
+                "Dynamic article Moss device", MossHookHub.Factory.DEVICE,
                 identity::rewriteDevice);
-        installIdentityHook(
-                "Dynamic article Moss Fawkes", createFawkes,
+        registerIdentityRewriter(
+                "Dynamic article Moss Fawkes", MossHookHub.Factory.FAWKES,
                 identity::preserveFawkes);
 
-        Class<?> descriptorClass = module.load(classLoader, "io.grpc.MethodDescriptor");
-        Class<?> generatedMessageClass = module.load(
-                classLoader, "com.google.protobuf.GeneratedMessageLite");
-        Class<?> responseHandlerClass = module.load(
-                classLoader, "com.bilibili.lib.moss.api.MossResponseHandler");
-        Class<?> httpRuleClass = module.load(
-                classLoader, "com.bilibili.lib.moss.api.MossHttpRule");
-        Class<?> serviceClass = module.load(
-                classLoader, "com.bilibili.lib.moss.api.MossServiceImp");
-        Method descriptorName = module.declaredMethod(descriptorClass, "c");
-        Method asyncUnaryCall = module.declaredMethod(
-                serviceClass, "asyncUnaryCall", descriptorClass,
-                generatedMessageClass, responseHandlerClass, httpRuleClass);
-        Method blockingUnaryCall = module.declaredMethod(
-                serviceClass, "blockingUnaryCall", descriptorClass,
-                generatedMessageClass, httpRuleClass);
-        module.deoptimizeFeatureMethod(asyncUnaryCall);
-        module.deoptimizeFeatureMethod(blockingUnaryCall);
-        installMossCallScope(
-                "Dynamic article async read RPC", asyncUnaryCall, descriptorName);
-        installMossCallScope(
-                "Dynamic article blocking read RPC", blockingUnaryCall, descriptorName);
-        installDynamicGrpcTransportScope(descriptorName);
+        mossHub.addUnaryCallScope(new MossHookHub.UnaryCallScope() {
+            @Override
+            public boolean matches(String fullMethodName) {
+                return isDynamicReadRpc(fullMethodName);
+            }
+
+            @Override
+            public Object around(String fullMethodName, XposedInterface.Chain chain,
+                    Object[] args, MossHookHub.Next next) throws Throwable {
+                module.ensureFeatureSettings(currentApplication());
+                if (!module.isDynamicArticleFixEnabled()) {
+                    return next.proceed(args);
+                }
+                String source = "Moss " + fullMethodName;
+                logTargetRequest(source);
+                return withScope(source, () -> next.proceed(args));
+            }
+        });
+        registerDynamicGrpcTransportScope();
         installSubgroup("gRPC final header rewrite",
-                () -> installMossGrpcHeaderRewrites(identity));
-        installMossOkHttpScope();
+                () -> registerMossGrpcHeaderRewrites(identity));
+        registerMossOkHttpScope();
     }
 
     /** Carries the dynamic-service scope from call creation to the transport thread. */
-    private void installDynamicGrpcTransportScope(Method descriptorName) throws Throwable {
-        Class<?> methodDescriptorClass = module.load(classLoader, "io.grpc.MethodDescriptor");
-        Class<?> callOptionsClass = module.load(classLoader, "io.grpc.c");
-        Class<?> channelClass = module.load(classLoader, "io.grpc.d");
-        Class<?> responseListenerClass = module.load(classLoader, "io.grpc.e$a");
-        Class<?> headersClass = module.load(classLoader, "io.grpc.n0");
-        Class<?> interceptorClass = module.load(classLoader, "of1.a");
-        Class<?> callClass = module.load(classLoader, "of1.a$a");
-        Method createCall = module.declaredMethod(
-                interceptorClass, "a", methodDescriptorClass,
-                callOptionsClass, channelClass);
-        Method startCall = module.declaredMethod(
-                callClass, "e", responseListenerClass, headersClass);
-        module.deoptimizeFeatureMethod(createCall);
-        module.deoptimizeFeatureMethod(startCall);
-
-        module.addHook("Dynamic article gRPC call registration", createCall, hookChain -> {
-            Object descriptor = hookChain.getArg(0);
-            String fullMethodName = String.valueOf(module.invoke(descriptorName, descriptor));
-            Object call = hookChain.proceed();
-            module.ensureFeatureSettings(currentApplication());
-            if (isDynamicReadRpc(fullMethodName)
-                    && module.isDynamicArticleFixEnabled()
-                    && call != null) {
-                dynamicCallScopes.put(call, "Dynamic-gRPC " + fullMethodName);
+    private void registerDynamicGrpcTransportScope() {
+        mossHub.addGrpcCallObserver(MossHookHub.PART_IDENTITY, new MossHookHub.GrpcCallObserver() {
+            @Override
+            public boolean matches(String fullMethodName) {
+                return isDynamicReadRpc(fullMethodName);
             }
-            return call;
-        });
 
-        module.addHook("Dynamic article gRPC transport scope", startCall, hookChain -> {
-            String source = dynamicCallScopes.remove(hookChain.getThisObject());
-            module.ensureFeatureSettings(currentApplication());
-            if (source == null || !module.isDynamicArticleFixEnabled()) {
-                return hookChain.proceed();
+            @Override
+            public void onCallCreated(String part, String fullMethodName, Object call) {
+                module.ensureFeatureSettings(currentApplication());
+                if (module.isDynamicArticleFixEnabled()) {
+                    dynamicCallScopes.put(call, "Dynamic-gRPC " + fullMethodName);
+                }
             }
-            return withScope(source, hookChain::proceed);
+
+            @Override
+            public Object claimStart(String part, Object call) {
+                return dynamicCallScopes.remove(call);
+            }
+
+            @Override
+            public Object aroundStart(String part, Object token, XposedInterface.Chain chain,
+                    Object[] args, MossHookHub.Next next) throws Throwable {
+                module.ensureFeatureSettings(currentApplication());
+                if (!module.isDynamicArticleFixEnabled()) {
+                    return next.proceed(args);
+                }
+                return withScope((String) token, () -> next.proceed(args));
+            }
         });
     }
 
-    private void installMossGrpcHeaderRewrites(
+    private void registerMossGrpcHeaderRewrites(
             DynamicArticleRequestIdentity identity) throws Throwable {
         Class<?> headersClass = module.load(classLoader, "io.grpc.n0");
         Class<?> headerKeyClass = module.load(classLoader, "io.grpc.n0$h");
@@ -300,55 +288,42 @@ public final class DynamicArticleIdentityHooks {
                 headersClass, "o", headerKeyClass, Object.class);
         HeaderAccess access = new HeaderAccess(headerGet, headerDiscard, headerPut);
 
-        installMossGrpcHeaderRewrite(
-                "metadata/device", "of1.a", "c", headersClass, access,
+        registerMossGrpcHeaderRewrite(
+                MossHookHub.PART_IDENTITY, "of1.a", access,
                 new HeaderRewrite("a", "x-bili-metadata-bin", identity::rewriteMetadata),
                 new HeaderRewrite("c", "x-bili-device-bin", identity::rewriteDevice));
-        installMossGrpcHeaderRewrite(
-                "Fawkes", "rf1.a", "d", headersClass, access,
+        registerMossGrpcHeaderRewrite(
+                MossHookHub.PART_FAWKES, "rf1.a", access,
                 new HeaderRewrite("a", "x-bili-fawkes-req-bin", identity::preserveFawkes));
     }
 
-    private void installMossGrpcHeaderRewrite(
+    private void registerMossGrpcHeaderRewrite(
             String part,
             String interceptorClassName,
-            String populateMethodName,
-            Class<?> headersClass,
             HeaderAccess access,
             HeaderRewrite... rewrites) throws Throwable {
         Class<?> interceptorClass = module.load(classLoader, interceptorClassName);
-        Method populate = module.declaredMethod(
-                interceptorClass, populateMethodName, headersClass);
         for (HeaderRewrite rewrite : rewrites) {
             rewrite.keyField = module.declaredField(
                     interceptorClass, rewrite.keyFieldName);
         }
-        module.deoptimizeFeatureMethod(populate);
 
-        module.addHook("Dynamic article Moss gRPC " + part + " header rewrite", populate,
-                hookChain -> {
-                    Object result = hookChain.proceed();
-                    String source = requestScope.get();
-                    if (source == null || !module.isDynamicArticleFixEnabled()) {
-                        return result;
-                    }
-                    Object headers = hookChain.getArg(0);
-                    Object interceptor = hookChain.getThisObject();
-                    if (headers == null || interceptor == null) {
-                        return result;
-                    }
-                    for (HeaderRewrite rewrite : rewrites) {
-                        try {
-                            rewriteTransportHeader(
-                                    headers, interceptor, rewrite, access, source);
-                        } catch (Throwable throwable) {
-                            module.error("Dynamic article transport header rewrite failed: "
-                                    + "header=" + rewrite.headerName
-                                    + " source=" + source, throwable);
-                        }
-                    }
-                    return result;
-                });
+        mossHub.addHeaderPopulateListener(part, (hookPart, interceptor, headers) -> {
+            String source = requestScope.get();
+            if (source == null || !module.isDynamicArticleFixEnabled()) {
+                return;
+            }
+            for (HeaderRewrite rewrite : rewrites) {
+                try {
+                    rewriteTransportHeader(
+                            headers, interceptor, rewrite, access, source);
+                } catch (Throwable throwable) {
+                    module.error("Dynamic article transport header rewrite failed: "
+                            + "header=" + rewrite.headerName
+                            + " source=" + source, throwable);
+                }
+            }
+        });
     }
 
     private void rewriteTransportHeader(
@@ -386,18 +361,15 @@ public final class DynamicArticleIdentityHooks {
         }
     }
 
-    private void installIdentityHook(
-            String label, Method factory, IdentityRewriter rewriter) {
-        module.addHook(label, factory, hookChain -> {
-            Object result = hookChain.proceed();
+    private void registerIdentityRewriter(
+            String label, MossHookHub.Factory factory, IdentityRewriter rewriter) {
+        mossHub.addFactoryRewriter(factory, bytes -> {
             String source = requestScope.get();
-            if (source == null || !module.isDynamicArticleFixEnabled()
-                    || !(result instanceof byte[])) {
-                return result;
+            if (source == null || !module.isDynamicArticleFixEnabled()) {
+                return bytes;
             }
             try {
-                DynamicArticleRequestIdentity.RewriteResult rewritten =
-                        rewriter.rewrite((byte[]) result);
+                DynamicArticleRequestIdentity.RewriteResult rewritten = rewriter.rewrite(bytes);
                 if (module.isVerboseLoggingEnabled()) {
                     int sequence = identityLogCount.incrementAndGet();
                     if (shouldSample(sequence, 20, 100)) {
@@ -413,54 +385,30 @@ public final class DynamicArticleIdentityHooks {
             } catch (Throwable throwable) {
                 module.error(label + " rewrite failed; original bytes retained: source="
                         + source, throwable);
-                return result;
+                return bytes;
             }
         });
     }
 
-    private void installMossCallScope(
-            String label, Method callMethod, Method descriptorName) {
-        module.addHook(label, callMethod, hookChain -> {
-            Object descriptor = hookChain.getArg(0);
-            String fullMethodName = String.valueOf(
-                    module.invoke(descriptorName, descriptor));
-            if (!isDynamicReadRpc(fullMethodName)) {
-                return hookChain.proceed();
+    private void registerMossOkHttpScope() {
+        mossHub.addOkHttpScope(MossHookHub.PART_IDENTITY, new MossHookHub.OkHttpScope() {
+            @Override
+            public boolean matches(String url) {
+                return isDynamicReadRpc(url);
             }
-            module.ensureFeatureSettings(currentApplication());
-            if (!module.isDynamicArticleFixEnabled()) {
-                return hookChain.proceed();
-            }
-            String source = "Moss " + fullMethodName;
-            logTargetRequest(source);
-            return withScope(source, hookChain::proceed);
-        });
-    }
 
-    private void installMossOkHttpScope() throws Throwable {
-        Class<?> interceptorClass = module.load(classLoader, "cg1.a");
-        Class<?> chainClass = module.load(classLoader, "okhttp3.u$a");
-        Class<?> requestClass = module.load(classLoader, "okhttp3.a0");
-        Method intercept = module.declaredMethod(interceptorClass, "intercept", chainClass);
-        Method getRequest = module.declaredMethod(chainClass, "request");
-        Method getUrl = module.declaredMethod(requestClass, "l");
-        module.deoptimizeFeatureMethod(intercept);
-
-        module.addHook("Dynamic article Moss OkHttp read scope", intercept, hookChain -> {
-            Object chain = hookChain.getArg(0);
-            Object request = module.invoke(getRequest, chain);
-            String url = String.valueOf(module.invoke(getUrl, request));
-            if (!isDynamicReadRpc(url)) {
-                return hookChain.proceed();
+            @Override
+            public Object around(String part, String url, XposedInterface.Chain chain,
+                    Object[] args, MossHookHub.Next next) throws Throwable {
+                module.ensureFeatureSettings(currentApplication());
+                if (!module.isDynamicArticleFixEnabled()) {
+                    return next.proceed(args);
+                }
+                Uri uri = Uri.parse(url);
+                String source = "Moss-OkHttp " + uri.getEncodedPath();
+                logTargetRequest(source);
+                return withScope(source, () -> next.proceed(args));
             }
-            module.ensureFeatureSettings(currentApplication());
-            if (!module.isDynamicArticleFixEnabled()) {
-                return hookChain.proceed();
-            }
-            Uri uri = Uri.parse(url);
-            String source = "Moss-OkHttp " + uri.getEncodedPath();
-            logTargetRequest(source);
-            return withScope(source, hookChain::proceed);
         });
     }
 

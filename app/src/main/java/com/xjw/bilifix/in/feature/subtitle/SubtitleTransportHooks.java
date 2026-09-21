@@ -66,12 +66,14 @@ final class SubtitleTransportHooks {
                 functionClass, functionClass);
         module.deoptimizeFeatureMethod(request);
         module.addHook("AI subtitle Chronos URLRequest", request, chain -> {
+            if (!isDiagnosticsEnabled()) {
+                return chain.proceed();
+            }
             Object requestValue = chain.getArg(0);
             String url = stringValue(module.invoke(getUrl, requestValue));
             if (!shouldInspect(url)) {
                 return chain.proceed();
             }
-            module.ensureFeatureSettings(currentApplication());
             if (module.isAiSubtitleEnabled()) {
                 int sample = requestSequence.incrementAndGet();
                 module.info("AI subtitle transport request: sample=" + sample
@@ -104,13 +106,15 @@ final class SubtitleTransportHooks {
         module.deoptimizeFeatureMethod(onError);
 
         module.addHook("AI subtitle Chronos HTTP response", onResponse, chain -> {
+            if (!isDiagnosticsEnabled()) {
+                return chain.proceed();
+            }
             Object callback = chain.getThisObject();
             Object request = callbackRequest.get(callback);
             String url = stringValue(module.invoke(getUrl, request));
             if (!shouldInspect(url)) {
                 return chain.proceed();
             }
-            module.ensureFeatureSettings(currentApplication());
             if (!module.isAiSubtitleEnabled()) {
                 return chain.proceed();
             }
@@ -141,11 +145,13 @@ final class SubtitleTransportHooks {
         });
 
         module.addHook("AI subtitle Chronos HTTP error", onError, chain -> {
+            if (!isDiagnosticsEnabled()) {
+                return chain.proceed();
+            }
             Object callback = chain.getThisObject();
             Object request = callbackRequest.get(callback);
             String url = stringValue(module.invoke(getUrl, request));
             if (shouldInspect(url)) {
-                module.ensureFeatureSettings(currentApplication());
                 if (module.isAiSubtitleEnabled()) {
                     Object error = chain.getArg(0);
                     module.warn("AI subtitle transport error: url=" + sanitizeUrl(url)
@@ -154,6 +160,11 @@ final class SubtitleTransportHooks {
             }
             return chain.proceed();
         });
+    }
+
+    private boolean isDiagnosticsEnabled() {
+        module.ensureFeatureSettings(currentApplication());
+        return module.isVerboseLoggingEnabled();
     }
 
     private static boolean shouldInspect(String rawUrl) {

@@ -26,6 +26,7 @@ final class RecoveredSubtitleLabeler {
     private final Method videoToBuilder;
     private final Method setSubtitles;
     private final Method videoBuild;
+    private static final Object UNCHANGED = new Object();
     private final Map<Object, Object> cache =
             Collections.synchronizedMap(new WeakHashMap<>());
 
@@ -57,6 +58,9 @@ final class RecoveredSubtitleLabeler {
         }
         synchronized (cache) {
             Object cached = cache.get(source);
+            if (cached == UNCHANGED) {
+                return source;
+            }
             if (cached != null) {
                 return cached;
             }
@@ -92,7 +96,7 @@ final class RecoveredSubtitleLabeler {
         Object result = videoBuilder == null
                 ? source : module.invoke(videoBuild, videoBuilder);
         synchronized (cache) {
-            cache.put(source, result);
+            cache.put(source, videoBuilder == null ? UNCHANGED : result);
         }
         if (labeled > 0) {
             module.info("AI subtitle recovered-track labels added: tracks=" + labeled);

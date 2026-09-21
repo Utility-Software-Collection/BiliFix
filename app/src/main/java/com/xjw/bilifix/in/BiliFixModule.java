@@ -21,6 +21,8 @@ import io.github.libxposed.api.XposedModule;
 import com.xjw.bilifix.in.core.HookApi;
 import com.xjw.bilifix.in.core.HostApplication;
 import com.xjw.bilifix.in.core.HostVersion;
+import com.xjw.bilifix.in.core.MossHookHub;
+import com.xjw.bilifix.in.core.RestHookHub;
 import com.xjw.bilifix.in.feature.article.ArticleHooks;
 import com.xjw.bilifix.in.feature.article.DynamicArticleIdentityHooks;
 import com.xjw.bilifix.in.feature.commenttranslation.CommentTranslationHooks;
@@ -92,14 +94,16 @@ public final class BiliFixModule extends XposedModule implements HookApi {
         }
 
         installApplicationSettingsHook(classLoader);
+        MossHookHub mossHub = new MossHookHub(this, classLoader);
+        RestHookHub restHub = new RestHookHub(this, classLoader);
         new WebViewThemeHooks(this, classLoader).install();
         new CompatFeatureHooks(this, classLoader).install();
-        new PaidEmoticonHooks(this, classLoader).install();
-        IpLocationHooks locationHooks = new IpLocationHooks(this, classLoader);
+        new PaidEmoticonHooks(this, classLoader, restHub).install();
+        IpLocationHooks locationHooks = new IpLocationHooks(this, classLoader, mossHub, restHub);
         if (mainProcess) {
-            new DynamicArticleIdentityHooks(this, classLoader).install();
+            new DynamicArticleIdentityHooks(this, classLoader, mossHub).install();
             new CommentTranslationHooks(this, classLoader).install();
-            new AiSubtitleHooks(this, classLoader).install();
+            new AiSubtitleHooks(this, classLoader, mossHub).install();
             locationHooks.install();
             settingsManager.installUiHooks(classLoader);
             SystemShareHooks shareHooks = new SystemShareHooks(this, classLoader);
@@ -109,6 +113,8 @@ public final class BiliFixModule extends XposedModule implements HookApi {
             locationHooks.install();
             new ArticleHooks(this, classLoader).install();
         }
+        mossHub.install();
+        restHub.install();
 
         info("hook installation finished: installed=" + hookHandles.size());
         schedulePostPackageInitialization();
@@ -372,16 +378,17 @@ public final class BiliFixModule extends XposedModule implements HookApi {
             return;
         }
         String processMessage = "[" + processName + "] " + message;
+        try {
+            log(priority, TAG, processMessage, throwable);
+            return;
+        } catch (Throwable ignored) {
+            // Android logcat remains available if framework logging is unavailable.
+        }
         if (throwable == null) {
             Log.println(priority, TAG, processMessage);
         } else {
             Log.println(priority, TAG,
                     processMessage + "\n" + Log.getStackTraceString(throwable));
-        }
-        try {
-            log(priority, TAG, processMessage, throwable);
-        } catch (Throwable ignored) {
-            // Android logcat remains available if framework logging is unavailable.
         }
     }
 

@@ -5,13 +5,13 @@ import android.content.Context;
 import android.content.ContextWrapper;
 import android.os.Handler;
 import android.os.Looper;
-import android.text.Spanned;
-import android.text.SpannedString;
 import android.view.View;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.xjw.bilifix.in.R;
 import com.xjw.bilifix.in.core.HookApi;
+import com.xjw.bilifix.in.core.HostApplication;
 
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Constructor;
@@ -40,6 +40,8 @@ public final class CommentTranslationHooks {
     private static final int SWITCH_SHOW_ORIGIN = 3;
     private static final int MAX_TRANSLATION_THREADS = 2;
     private static final int MAX_QUEUED_TRANSLATIONS = 16;
+    private static final int MAX_BOUND_VIEW_ENTRIES = 256;
+    private static final int TAG_DISPLAY_STATE = R.id.bilifix_comment_translation_state;
 
     private final HookApi module;
     private final ClassLoader classLoader;
@@ -48,10 +50,8 @@ public final class CommentTranslationHooks {
     private final ThreadLocal<BindingCapture> activeBindingCapture = new ThreadLocal<>();
     private final Map<Object, LongPressContext> injectedMenuItems =
             Collections.synchronizedMap(new WeakHashMap<>());
-    private final Map<TextView, ViewDisplayState> viewDisplayStates =
-            Collections.synchronizedMap(new WeakHashMap<>());
-    private final Map<TextView, Object> boundViewComments =
-            Collections.synchronizedMap(new WeakHashMap<>());
+    private final Map<Long, WeakReference<TextView>> boundViews =
+            boundedMap(MAX_BOUND_VIEW_ENTRIES);
     private final Map<Long, Integer> serverSwitches = boundedMap(2048);
     private final Map<Long, TranslationState> states = boundedMap(512);
     private final AtomicInteger fallbackEligibilityLogs = new AtomicInteger();
@@ -199,6 +199,10 @@ public final class CommentTranslationHooks {
             module.addHook("comment translation switch mapper " + method.getName(),
                     method, chain -> {
                         Object result = chain.proceed();
+                        module.ensureFeatureSettings(HostApplication.get());
+                        if (!module.isAiCommentTranslationEnabled()) {
+                            return result;
+                        }
                         try {
                             Object replyInfo = chain.getArg(0);
                             long rpid = ((Number) module.invoke(
@@ -457,7 +461,7 @@ public final class CommentTranslationHooks {
                     if (capture != null && chain.getThisObject() == capture.view) {
                         Object value = chain.getArg(0);
                         if (value instanceof CharSequence) {
-                            capture.originalRendered = immutableOriginal(
+                            capture.originalRendered = originalOrRaw(
                                     (CharSequence) value, capture.rawText);
                             capture.setterCaptured = true;
                             // Guarded at the call site: this sits on setText, which runs even
@@ -500,6 +504,10 @@ public final class CommentTranslationHooks {
         boolean deoptimized = module.deoptimizeFeatureMethod(bind);
         module.addHook("comment translation bind " + handlerClass.getSimpleName(),
                 bind, chain -> {
+                    module.ensureFeatureSettings(HostApplication.get());
+                    if (!module.isAiCommentTranslationEnabled()) {
+                        return chain.proceed();
+                    }
                     Object commentItem = chain.getArg(0);
                     TextView textView;
                     long rpid;
@@ -514,7 +522,7 @@ public final class CommentTranslationHooks {
                             return chain.proceed();
                         }
                         rawText = readRawText(commentItem);
-                        previous = viewDisplayStates.get(textView);
+                        previous = displayStateOf(textView);
                     } catch (Throwable throwable) {
                         module.error("comment translation bind preparation failed: handler="
                                 + handlerClass.getSimpleName(), throwable);
@@ -539,19 +547,19 @@ public final class CommentTranslationHooks {
                         boolean restoreTranslation = previous != null
                                 && previous.rpid == rpid
                                 && previous.showingTranslation;
-                        boundViewComments.put(textView, commentItem);
+                        rememberBoundView(rpid, textView);
                         TranslationState state;
                         synchronized (states) {
                             state = states.get(rpid);
                         }
                         String translatedText = state == null ? null : state.translatedText;
-                        CharSequence original = immutableOriginal(
+                        CharSequence original = originalOrRaw(
                                 capture.originalRendered, rawText);
                         ViewDisplayState displayState = new ViewDisplayState(rpid, original);
                         displayState.showingTranslation = restoreTranslation
                                 && translatedText != null
                                 && !translatedText.isEmpty();
-                        viewDisplayStates.put(textView, displayState);
+                        textView.setTag(TAG_DISPLAY_STATE, displayState);
                         // Guarded at the call site: textFingerprint() walks the whole comment
                         // body, and this runs for every bound row while the list scrolls.
                         if (module.isVerboseLoggingEnabled()) {
@@ -595,25 +603,30 @@ public final class CommentTranslationHooks {
             serverSwitch = serverSwitches.getOrDefault(rpid, 0);
         }
         if (view != null) {
-            boundViewComments.put(view, commentItem);
+            rememberBoundView(rpid, view);
             viewDisplayStateFor(view, rpid, raw);
         }
         return new LongPressContext(
                 rpid, oid, type, raw, serverSwitch, view, fallbackContext);
     }
 
+    private void rememberBoundView(long rpid, TextView view) {
+        synchronized (boundViews) {
+            boundViews.put(rpid, new WeakReference<>(view));
+        }
+    }
+
     private TextView findBoundView(Object commentItem) throws Throwable {
         if (commentItem == null) {
             return null;
         }
-        synchronized (boundViewComments) {
-            for (Map.Entry<TextView, Object> entry : boundViewComments.entrySet()) {
-                if (entry.getValue() == commentItem) {
-                    return entry.getKey();
-                }
-            }
+        long rpid = getCommentLong(commentItem, commentGetId);
+        WeakReference<TextView> reference;
+        synchronized (boundViews) {
+            reference = boundViews.get(rpid);
         }
-        return null;
+        TextView view = reference == null ? null : reference.get();
+        return isStillBound(view, rpid) ? view : null;
     }
 
     private LongPressContext matchingPendingContext(Object commentItem) throws Throwable {
@@ -803,8 +816,13 @@ public final class CommentTranslationHooks {
         if (view == null) {
             return false;
         }
-        ViewDisplayState displayState = viewDisplayStates.get(view);
+        ViewDisplayState displayState = displayStateOf(view);
         return displayState != null && displayState.rpid == rpid;
+    }
+
+    private static ViewDisplayState displayStateOf(TextView view) {
+        Object tag = view.getTag(TAG_DISPLAY_STATE);
+        return tag instanceof ViewDisplayState ? (ViewDisplayState) tag : null;
     }
 
     private void dismissCommentMenu(View menuView) {
@@ -907,32 +925,28 @@ public final class CommentTranslationHooks {
         if (view == null) {
             return null;
         }
-        synchronized (viewDisplayStates) {
-            ViewDisplayState current = viewDisplayStates.get(view);
-            if (current != null && current.rpid == rpid) {
-                return current;
-            }
-            CharSequence original = immutableOriginal(null, rawText);
-            ViewDisplayState created = new ViewDisplayState(rpid, original);
-            viewDisplayStates.put(view, created);
-            if (module.isVerboseLoggingEnabled()) {
-                module.debug("comment view state recreated from model: rpid=" + rpid
-                        + " view=" + viewIdentity(view)
-                        + " original=" + textFingerprint(original));
-            }
-            return created;
+        ViewDisplayState current = displayStateOf(view);
+        if (current != null && current.rpid == rpid) {
+            return current;
         }
+        CharSequence original = originalOrRaw(null, rawText);
+        ViewDisplayState created = new ViewDisplayState(rpid, original);
+        view.setTag(TAG_DISPLAY_STATE, created);
+        if (module.isVerboseLoggingEnabled()) {
+            module.debug("comment view state recreated from model: rpid=" + rpid
+                    + " view=" + viewIdentity(view)
+                    + " original=" + textFingerprint(original));
+        }
+        return created;
     }
 
-    private static CharSequence immutableOriginal(
+    private static CharSequence originalOrRaw(
             CharSequence rendered,
             String rawText) {
-        CharSequence source = hasText(rendered) ? rendered : rawText;
-        if (!hasText(source)) {
-            return "";
+        if (hasText(rendered)) {
+            return rendered;
         }
-        return source instanceof Spanned
-                ? new SpannedString(source) : source.toString();
+        return hasText(rawText) ? rawText : "";
     }
 
     private static int viewIdentity(TextView view) {
@@ -946,7 +960,15 @@ public final class CommentTranslationHooks {
     }
 
     private static boolean hasText(CharSequence value) {
-        return value != null && !value.toString().trim().isEmpty();
+        if (value == null) {
+            return false;
+        }
+        for (int index = 0; index < value.length(); index++) {
+            if (value.charAt(index) > ' ') {
+                return true;
+            }
+        }
+        return false;
     }
 
     private TranslationState stateFor(long rpid) {

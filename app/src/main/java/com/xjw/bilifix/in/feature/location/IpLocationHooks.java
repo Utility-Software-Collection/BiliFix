@@ -5,6 +5,8 @@ import android.net.Uri;
 
 import com.xjw.bilifix.in.core.HookApi;
 import com.xjw.bilifix.in.core.HostApplication;
+import com.xjw.bilifix.in.core.MossHookHub;
+import com.xjw.bilifix.in.core.RestHookHub;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -18,6 +20,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import io.github.libxposed.api.XposedInterface;
 
 /** Supplies a compatible request identity needed by the host's existing IP location UI. */
 public final class IpLocationHooks {
@@ -37,6 +41,7 @@ public final class IpLocationHooks {
     private static final String REPLY_SERVICE =
             "bilibili.main.community.reply.v1.Reply/";
     private static final String PROFILE_PATH = "/x/v2/space";
+    private static final String COMMENT_REST_PATH_PREFIX = "/x/v2/reply";
 
     /** BiliSpace fields that only ever carry domestic-exclusive modules. */
     private static final String[] MODULE_FIELDS = {
@@ -87,6 +92,8 @@ public final class IpLocationHooks {
 
     private final HookApi module;
     private final ClassLoader classLoader;
+    private final MossHookHub mossHub;
+    private final RestHookHub restHub;
     private final ThreadLocal<RequestScope> requestScope = new ThreadLocal<>();
     private final Map<Object, RequestScope> mossCallScopes =
             Collections.synchronizedMap(new WeakHashMap<>());
@@ -98,9 +105,12 @@ public final class IpLocationHooks {
     private final Set<String> observedTabParams =
             Collections.synchronizedSet(new HashSet<>());
 
-    public IpLocationHooks(HookApi module, ClassLoader classLoader) {
+    public IpLocationHooks(HookApi module, ClassLoader classLoader,
+            MossHookHub mossHub, RestHookHub restHub) {
         this.module = module;
         this.classLoader = classLoader;
+        this.mossHub = mossHub;
+        this.restHub = restHub;
     }
 
     public void install() {
@@ -117,50 +127,40 @@ public final class IpLocationHooks {
     }
 
     private void installRestIdentityHooks() throws Throwable {
-        Class<?> requestClass = module.load(classLoader, "okhttp3.a0");
-        Class<?> interceptorClass = module.load(classLoader,
-                "com.bilibili.okretro.interceptor.a");
-        Class<?> configClass = module.load(classLoader, "dc.a");
-
-        Method requestUrl = module.declaredMethod(requestClass, "l");
-        Method requestVerb = module.declaredMethod(requestClass, "h");
-        Method intercept = module.declaredMethod(interceptorClass, "intercept", requestClass);
-        Method addCommonParam = module.declaredMethod(
-                interceptorClass, "addCommonParam", Map.class);
-        Method userAgent = module.declaredMethod(configClass, "c");
-
-        module.deoptimizeFeatureMethod(intercept);
-        module.deoptimizeFeatureMethod(addCommonParam);
-
-        module.addHook("IP location targeted REST scope", intercept, hookChain -> {
-            Object request = hookChain.getArg(0);
-            String url = String.valueOf(module.invoke(requestUrl, request));
-            String verb = String.valueOf(module.invoke(requestVerb, request));
-            ScopeKind kind = classifyRestRequest(url, verb);
-            if (kind == null) {
-                return hookChain.proceed();
+        restHub.addRequestScope(new RestHookHub.RequestScope() {
+            @Override
+            public boolean matches(String url, String verb) {
+                return (url.contains(PROFILE_PATH) || url.contains(COMMENT_REST_PATH_PREFIX))
+                        && classifyRestRequest(url, verb) != null;
             }
-            module.ensureFeatureSettings(currentApplication());
-            if (!isMasqueradeEnabled(kind)) {
-                return hookChain.proceed();
+
+            @Override
+            public Object around(String url, String verb, XposedInterface.Chain chain,
+                    Object[] args, RestHookHub.Next next) throws Throwable {
+                ScopeKind kind = classifyRestRequest(url, verb);
+                if (kind == null) {
+                    return next.proceed(args);
+                }
+                module.ensureFeatureSettings(currentApplication());
+                if (!isMasqueradeEnabled(kind)) {
+                    return next.proceed(args);
+                }
+                Uri uri = Uri.parse(url);
+                String source = kind.logName + " " + uri.getHost() + uri.getEncodedPath();
+                logTargetRequest(kind, source);
+                return withScope(kind, source, () -> next.proceed(args));
             }
-            Uri uri = Uri.parse(url);
-            String source = kind.logName + " " + uri.getHost() + uri.getEncodedPath();
-            logTargetRequest(kind, source);
-            return withScope(kind, source, hookChain::proceed);
         });
 
-        module.addHook("IP location domestic REST parameters", addCommonParam, hookChain -> {
-            Object result = hookChain.proceed();
+        restHub.addCommonParamListener(value -> {
             RequestScope scope = requestScope.get();
             if (scope == null || !scope.kind.isRest() || !isMasqueradeEnabled(scope.kind)) {
-                return result;
+                return;
             }
-            Object value = hookChain.getArg(0);
             if (!(value instanceof Map)) {
                 module.warn("IP location REST parameters unavailable: source="
                         + scope.source + " value=" + summarize(value));
-                return result;
+                return;
             }
             @SuppressWarnings("unchecked")
             Map<Object, Object> parameters = (Map<Object, Object>) value;
@@ -177,17 +177,13 @@ public final class IpLocationHooks {
                     + scope.source + " mobi_app=" + mobiApp
                     + " build=" + parameters.get("build")
                     + " appkey=" + APPKEY_POLICY);
-            return result;
         });
 
-        module.addHook("IP location domestic REST user agent", userAgent, hookChain -> {
-            Object result = hookChain.proceed();
+        restHub.addUserAgentRewriter(original -> {
             RequestScope scope = requestScope.get();
-            if (scope == null || !scope.kind.isRest() || !(result instanceof String)
-                    || !isMasqueradeEnabled(scope.kind)) {
-                return result;
+            if (scope == null || !scope.kind.isRest() || !isMasqueradeEnabled(scope.kind)) {
+                return original;
             }
-            String original = (String) result;
             String rewritten = rewriteRestUserAgent(original, scope.kind);
             if (!original.equals(rewritten)) {
                 module.debug("IP location REST user agent rewritten: source="
@@ -226,47 +222,41 @@ public final class IpLocationHooks {
                 module, classLoader,
                 "com.bapis.bilibili.metadata.fawkes.FawkesReq");
         Class<?> metadataFactoryClass = module.load(classLoader, "if1.a");
-        Method createMetadata = module.declaredMethod(metadataFactoryClass, "n");
-        Method createDevice = module.declaredMethod(metadataFactoryClass, "k");
-        Method createFawkes = module.declaredMethod(metadataFactoryClass, "i");
-        module.deoptimizeFeatureMethod(createMetadata);
-        module.deoptimizeFeatureMethod(createDevice);
-        module.deoptimizeFeatureMethod(createFawkes);
-        installProtoRewriteHook("IP location Moss metadata", createMetadata, metadata);
-        installProtoRewriteHook("IP location Moss device", createDevice, device);
-        installProtoRewriteHook("IP location Moss Fawkes", createFawkes, fawkes);
+        registerProtoRewriter("IP location Moss metadata", MossHookHub.Factory.METADATA, metadata);
+        registerProtoRewriter("IP location Moss device", MossHookHub.Factory.DEVICE, device);
+        registerProtoRewriter("IP location Moss Fawkes", MossHookHub.Factory.FAWKES, fawkes);
         if (resolvedAuth != null) {
             CommentAuthCoordinator auth = resolvedAuth;
             installMossSubgroup("comment authentication repair",
                     () -> auth.install(metadataFactoryClass));
         }
 
-        Class<?> methodDescriptorClass = module.load(classLoader, "io.grpc.MethodDescriptor");
-        Class<?> generatedMessageClass = module.load(classLoader,
-                "com.google.protobuf.GeneratedMessageLite");
-        Class<?> responseHandlerClass = module.load(classLoader,
-                "com.bilibili.lib.moss.api.MossResponseHandler");
-        Class<?> httpRuleClass = module.load(classLoader,
-                "com.bilibili.lib.moss.api.MossHttpRule");
-        Class<?> serviceClass = module.load(classLoader,
-                "com.bilibili.lib.moss.api.MossServiceImp");
-        Method descriptorName = module.declaredMethod(methodDescriptorClass, "c");
-        Method asyncUnaryCall = module.declaredMethod(serviceClass, "asyncUnaryCall",
-                methodDescriptorClass, generatedMessageClass,
-                responseHandlerClass, httpRuleClass);
-        Method blockingUnaryCall = module.declaredMethod(serviceClass, "blockingUnaryCall",
-                methodDescriptorClass, generatedMessageClass, httpRuleClass);
-        module.deoptimizeFeatureMethod(asyncUnaryCall);
-        module.deoptimizeFeatureMethod(blockingUnaryCall);
-        installMossCallScope("IP location async comment RPC", asyncUnaryCall, descriptorName);
-        installMossCallScope("IP location blocking comment RPC", blockingUnaryCall,
-                descriptorName);
+        mossHub.addUnaryCallScope(new MossHookHub.UnaryCallScope() {
+            @Override
+            public boolean matches(String fullMethodName) {
+                return isCommentReadRpc(fullMethodName);
+            }
 
-        installMossSubgroup("gRPC final transport",
-                () -> installMossGrpcTransportScopes(descriptorName));
+            @Override
+            public Object around(String fullMethodName, XposedInterface.Chain chain,
+                    Object[] args, MossHookHub.Next next) throws Throwable {
+                module.ensureFeatureSettings(currentApplication());
+                if (!module.isIpLocationEnabled()) {
+                    return next.proceed(args);
+                }
+                if (currentCommentSource() != null) {
+                    return next.proceed(args);
+                }
+                String source = "Moss " + fullMethodName;
+                logTargetRequest(ScopeKind.COMMENT_RPC, source);
+                return withScope(ScopeKind.COMMENT_RPC, source, () -> next.proceed(args));
+            }
+        });
+
+        installMossSubgroup("gRPC final transport", this::registerMossGrpcTransportScopes);
         installMossSubgroup("gRPC final header rewrite",
-                () -> installMossGrpcHeaderRewrites(metadata, device, fawkes));
-        installMossOkHttpScopes();
+                () -> registerMossGrpcHeaderRewrites(metadata, device, fawkes));
+        registerMossOkHttpScopes();
         installMossSubgroup("OkHttp encoded header fallback",
                 () -> installEncodedMossHeaderHooks(
                         metadataFactoryClass, metadata, device, fawkes));
@@ -283,10 +273,11 @@ public final class IpLocationHooks {
                     return null;
                 }));
         installMossSubgroup("gRPC outgoing header check", transport::installGrpc);
-        installMossSubgroup("OkHttp outgoing header check", transport::installOkHttp);
+        installMossSubgroup("OkHttp outgoing header check",
+                () -> transport.registerOkHttp(mossHub));
     }
 
-    private void installMossGrpcHeaderRewrites(
+    private void registerMossGrpcHeaderRewrites(
             ProtoRewriter metadata, ProtoRewriter device,
             ProtoRewriter fawkes) throws Throwable {
         Class<?> headersClass = module.load(classLoader, "io.grpc.n0");
@@ -300,49 +291,36 @@ public final class IpLocationHooks {
         List<HeaderRewrite> identityRewrites = new ArrayList<>();
         identityRewrites.add(new HeaderRewrite("a", "x-bili-metadata-bin", metadata));
         identityRewrites.add(new HeaderRewrite("c", "x-bili-device-bin", device));
-        installMossGrpcHeaderRewrite("metadata/device", "of1.a", "c", headersClass,
-                access,
+        registerMossGrpcHeaderRewrite(MossHookHub.PART_IDENTITY, "of1.a", access,
                 identityRewrites.toArray(new HeaderRewrite[0]));
-        installMossGrpcHeaderRewrite("Fawkes", "rf1.a", "d", headersClass,
-                access,
+        registerMossGrpcHeaderRewrite(MossHookHub.PART_FAWKES, "rf1.a", access,
                 new HeaderRewrite("a", "x-bili-fawkes-req-bin", fawkes));
     }
 
-    private void installMossGrpcHeaderRewrite(
-            String part, String interceptorClassName, String populateMethodName,
-            Class<?> headersClass, HeaderAccess access, HeaderRewrite... rewrites)
+    private void registerMossGrpcHeaderRewrite(
+            String part, String interceptorClassName,
+            HeaderAccess access, HeaderRewrite... rewrites)
             throws Throwable {
         Class<?> interceptorClass = module.load(classLoader, interceptorClassName);
-        Method populate = module.declaredMethod(
-                interceptorClass, populateMethodName, headersClass);
         for (HeaderRewrite rewrite : rewrites) {
             rewrite.keyField = module.declaredField(interceptorClass, rewrite.keyFieldName);
         }
-        module.deoptimizeFeatureMethod(populate);
 
-        module.addHook("IP location Moss gRPC " + part + " header rewrite", populate,
-                hookChain -> {
-                    Object result = hookChain.proceed();
-                    RequestScope scope = requestScope.get();
-                    if (scope == null || scope.kind != ScopeKind.COMMENT_RPC
-                            || !module.isIpLocationEnabled()) {
-                        return result;
-                    }
-                    Object headers = hookChain.getArg(0);
-                    Object interceptor = hookChain.getThisObject();
-                    if (headers == null || interceptor == null) {
-                        return result;
-                    }
-                    for (HeaderRewrite rewrite : rewrites) {
-                        try {
-                            rewriteTransportHeader(headers, interceptor, rewrite, access, scope);
-                        } catch (Throwable throwable) {
-                            module.error("IP location transport header rewrite failed: header="
-                                    + rewrite.headerName + " source=" + scope.source, throwable);
-                        }
-                    }
-                    return result;
-                });
+        mossHub.addHeaderPopulateListener(part, (hookPart, interceptor, headers) -> {
+            RequestScope scope = requestScope.get();
+            if (scope == null || scope.kind != ScopeKind.COMMENT_RPC
+                    || !module.isIpLocationEnabled()) {
+                return;
+            }
+            for (HeaderRewrite rewrite : rewrites) {
+                try {
+                    rewriteTransportHeader(headers, interceptor, rewrite, access, scope);
+                } catch (Throwable throwable) {
+                    module.error("IP location transport header rewrite failed: header="
+                            + rewrite.headerName + " source=" + scope.source, throwable);
+                }
+            }
+        });
     }
 
     private void rewriteOutgoingHeader(MossTransportHooks.Headers headers,
@@ -432,20 +410,19 @@ public final class IpLocationHooks {
                 fawkes, codec, decodeHeader, encodeHeader);
     }
 
-    private void installProtoRewriteHook(
-            String label, Method factory, ProtoRewriter rewriter) {
+    private void registerProtoRewriter(
+            String label, MossHookHub.Factory factory, ProtoRewriter rewriter) {
         // Per-hook counter: a shared one makes a partially bypassed triplet look like a
         // sampling artifact instead of the bug it is.
         AtomicInteger logCount = new AtomicInteger();
-        module.addHook(label, factory, hookChain -> {
-            Object result = hookChain.proceed();
+        mossHub.addFactoryRewriter(factory, bytes -> {
             RequestScope scope = requestScope.get();
             if (scope == null || scope.kind != ScopeKind.COMMENT_RPC
-                    || !module.isIpLocationEnabled() || !(result instanceof byte[])) {
-                return result;
+                    || !module.isIpLocationEnabled()) {
+                return bytes;
             }
             try {
-                ProtoRewriteResult rewritten = rewriter.rewrite((byte[]) result);
+                ProtoRewriteResult rewritten = rewriter.rewrite(bytes);
                 if (shouldSample(logCount.incrementAndGet(), 30, 100)) {
                     module.debug(label
                             + (rewritten.changed ? " rewritten" : " preserved")
@@ -458,7 +435,7 @@ public final class IpLocationHooks {
             } catch (Throwable throwable) {
                 module.error(label + " rewrite failed; original bytes retained: source="
                         + scope.source, throwable);
-                return result;
+                return bytes;
             }
         });
     }
@@ -507,123 +484,70 @@ public final class IpLocationHooks {
         });
     }
 
-    private void installMossCallScope(
-            String label, Method callMethod, Method descriptorName) {
-        module.addHook(label, callMethod, hookChain -> {
-            Object descriptor = hookChain.getArg(0);
-            String fullMethodName = String.valueOf(
-                    module.invoke(descriptorName, descriptor));
-            if (!isCommentReadRpc(fullMethodName)) {
-                return hookChain.proceed();
+    private void registerMossGrpcTransportScopes() {
+        MossHookHub.GrpcCallObserver observer = new MossHookHub.GrpcCallObserver() {
+            @Override
+            public boolean matches(String fullMethodName) {
+                return isCommentReadRpc(fullMethodName);
             }
-            module.ensureFeatureSettings(currentApplication());
-            if (!module.isIpLocationEnabled()) {
-                return hookChain.proceed();
+
+            @Override
+            public void onCallCreated(String part, String fullMethodName, Object call) {
+                module.ensureFeatureSettings(currentApplication());
+                if (module.isIpLocationEnabled()) {
+                    mossCallScopes.put(call, new RequestScope(
+                            ScopeKind.COMMENT_RPC,
+                            "Moss-gRPC " + fullMethodName + " [" + part + "]"));
+                }
             }
-            if (currentCommentSource() != null) {
-                return hookChain.proceed();
+
+            @Override
+            public Object claimStart(String part, Object call) {
+                return mossCallScopes.remove(call);
             }
-            logTargetRequest(ScopeKind.COMMENT_RPC, "Moss " + fullMethodName);
-            return withScope(ScopeKind.COMMENT_RPC,
-                    "Moss " + fullMethodName, hookChain::proceed);
-        });
+
+            @Override
+            public Object aroundStart(String part, Object token, XposedInterface.Chain chain,
+                    Object[] args, MossHookHub.Next next) throws Throwable {
+                RequestScope scope = (RequestScope) token;
+                if (!module.isIpLocationEnabled()) {
+                    return next.proceed(args);
+                }
+                logFinalTransport("grpc", scope.source);
+                return withScope(scope.kind, scope.source, () -> next.proceed(args));
+            }
+        };
+        mossHub.addGrpcCallObserver(MossHookHub.PART_IDENTITY, observer);
+        mossHub.addGrpcCallObserver(MossHookHub.PART_FAWKES, observer);
     }
 
-    private void installMossGrpcTransportScopes(Method descriptorName) throws Throwable {
-        Class<?> methodDescriptorClass = module.load(classLoader, "io.grpc.MethodDescriptor");
-        Class<?> callOptionsClass = module.load(classLoader, "io.grpc.c");
-        Class<?> channelClass = module.load(classLoader, "io.grpc.d");
-        Class<?> responseListenerClass = module.load(classLoader, "io.grpc.e$a");
-        Class<?> headersClass = module.load(classLoader, "io.grpc.n0");
-
-        installMossGrpcTransportScope(
-                "metadata/device", "of1.a", "of1.a$a", descriptorName,
-                methodDescriptorClass, callOptionsClass, channelClass,
-                responseListenerClass, headersClass);
-        installMossGrpcTransportScope(
-                "Fawkes", "rf1.a", "rf1.a$a", descriptorName,
-                methodDescriptorClass, callOptionsClass, channelClass,
-                responseListenerClass, headersClass);
-    }
-
-    private void installMossGrpcTransportScope(
-            String part, String interceptorClassName, String callClassName,
-            Method descriptorName, Class<?> methodDescriptorClass,
-            Class<?> callOptionsClass, Class<?> channelClass,
-            Class<?> responseListenerClass, Class<?> headersClass) throws Throwable {
-        Class<?> interceptorClass = module.load(classLoader, interceptorClassName);
-        Class<?> callClass = module.load(classLoader, callClassName);
-        Method createCall = module.declaredMethod(
-                interceptorClass, "a", methodDescriptorClass,
-                callOptionsClass, channelClass);
-        Method startCall = module.declaredMethod(
-                callClass, "e", responseListenerClass, headersClass);
-        module.deoptimizeFeatureMethod(createCall);
-        module.deoptimizeFeatureMethod(startCall);
-
-        module.addHook("IP location Moss gRPC " + part + " call registration",
-                createCall, hookChain -> {
-                    Object descriptor = hookChain.getArg(0);
-                    String fullMethodName = String.valueOf(
-                            module.invoke(descriptorName, descriptor));
-                    if (!isCommentReadRpc(fullMethodName)) {
-                        return hookChain.proceed();
-                    }
-                    module.ensureFeatureSettings(currentApplication());
-                    Object call = hookChain.proceed();
-                    if (module.isIpLocationEnabled() && call != null) {
-                        mossCallScopes.put(call, new RequestScope(
-                                ScopeKind.COMMENT_RPC,
-                                "Moss-gRPC " + fullMethodName + " [" + part + "]"));
-                    }
-                    return call;
-                });
-
-        module.addHook("IP location Moss gRPC " + part + " final headers",
-                startCall, hookChain -> {
-                    RequestScope scope = mossCallScopes.remove(hookChain.getThisObject());
-                    if (scope == null || !module.isIpLocationEnabled()) {
-                        return hookChain.proceed();
-                    }
-                    logFinalTransport("grpc", scope.source);
-                    return withScope(scope.kind, scope.source, hookChain::proceed);
-                });
-    }
-
-    private void installMossOkHttpScopes() {
+    private void registerMossOkHttpScopes() {
         installMossSubgroup("OkHttp metadata/device final transport",
-                () -> installMossOkHttpScope("metadata/device", "cg1.a"));
+                () -> registerMossOkHttpScope(MossHookHub.PART_IDENTITY));
         installMossSubgroup("OkHttp Fawkes final transport",
-                () -> installMossOkHttpScope("Fawkes", "dg1.a"));
+                () -> registerMossOkHttpScope(MossHookHub.PART_FAWKES));
     }
 
-    private void installMossOkHttpScope(String part, String interceptorClassName)
-            throws Throwable {
-        Class<?> interceptorClass = module.load(classLoader, interceptorClassName);
-        Class<?> chainClass = module.load(classLoader, "okhttp3.u$a");
-        Class<?> requestClass = module.load(classLoader, "okhttp3.a0");
-        Method intercept = module.declaredMethod(interceptorClass, "intercept", chainClass);
-        Method getRequest = module.declaredMethod(chainClass, "request");
-        Method getUrl = module.declaredMethod(requestClass, "l");
-        module.deoptimizeFeatureMethod(intercept);
+    private void registerMossOkHttpScope(String part) {
+        mossHub.addOkHttpScope(part, new MossHookHub.OkHttpScope() {
+            @Override
+            public boolean matches(String url) {
+                return isCommentReadRpc(url);
+            }
 
-        module.addHook("IP location Moss OkHttp " + part + " final headers",
-                intercept, hookChain -> {
-            Object chain = hookChain.getArg(0);
-            Object request = module.invoke(getRequest, chain);
-            String url = String.valueOf(module.invoke(getUrl, request));
-            if (!isCommentReadRpc(url)) {
-                return hookChain.proceed();
+            @Override
+            public Object around(String hookPart, String url, XposedInterface.Chain chain,
+                    Object[] args, MossHookHub.Next next) throws Throwable {
+                module.ensureFeatureSettings(currentApplication());
+                if (!isMasqueradeEnabled(ScopeKind.COMMENT_RPC)) {
+                    return next.proceed(args);
+                }
+                Uri uri = Uri.parse(url);
+                String source = "Moss-OkHttp " + uri.getEncodedPath() + " [" + part + "]";
+                logTargetRequest(ScopeKind.COMMENT_RPC, source);
+                logFinalTransport("downgrade-okhttp", source);
+                return withScope(ScopeKind.COMMENT_RPC, source, () -> next.proceed(args));
             }
-            module.ensureFeatureSettings(currentApplication());
-            if (!isMasqueradeEnabled(ScopeKind.COMMENT_RPC)) {
-                return hookChain.proceed();
-            }
-            Uri uri = Uri.parse(url);
-            String source = "Moss-OkHttp " + uri.getEncodedPath() + " [" + part + "]";
-            logTargetRequest(ScopeKind.COMMENT_RPC, source);
-            logFinalTransport("downgrade-okhttp", source);
-            return withScope(ScopeKind.COMMENT_RPC, source, hookChain::proceed);
         });
     }
 

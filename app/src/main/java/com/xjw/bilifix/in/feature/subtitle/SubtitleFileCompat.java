@@ -57,6 +57,9 @@ final class SubtitleFileCompat {
             if (!file.isFile() || sourceBytes <= 0 || sourceBytes > MAX_SUBTITLE_BYTES) {
                 return;
             }
+            if (!looksLikeJsonObject(file)) {
+                return;
+            }
             String source = readUtf8(file, sourceBytes);
             int jsonStart = findJsonObjectStart(source);
             if (jsonStart < 0) {
@@ -107,6 +110,29 @@ final class SubtitleFileCompat {
             module.error("AI subtitle file normalization failed: file=" + file.getAbsolutePath(),
                     throwable);
         }
+    }
+
+    private static boolean looksLikeJsonObject(File file) {
+        byte[] head = new byte[64];
+        int read;
+        try (FileInputStream input = new FileInputStream(file)) {
+            read = input.read(head);
+        } catch (Exception ignored) {
+            return false;
+        }
+        int index = 0;
+        if (read >= 3 && (head[0] & 0xFF) == 0xEF
+                && (head[1] & 0xFF) == 0xBB && (head[2] & 0xFF) == 0xBF) {
+            index = 3;
+        }
+        for (; index < read; index++) {
+            int current = head[index] & 0xFF;
+            if (current == ' ' || current == '\t' || current == '\r' || current == '\n') {
+                continue;
+            }
+            return current == '{';
+        }
+        return false;
     }
 
     private static int findJsonObjectStart(String source) {

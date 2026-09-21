@@ -1,6 +1,7 @@
 package com.xjw.bilifix.in.feature.location;
 
 import com.xjw.bilifix.in.core.HookApi;
+import com.xjw.bilifix.in.core.MossHookHub;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -10,6 +11,8 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Predicate;
+
+import io.github.libxposed.api.XposedInterface;
 
 /** Repairs assembled headers on both transports used by international 3.20.4. */
 final class MossTransportHooks {
@@ -69,47 +72,47 @@ final class MossTransportHooks {
         });
     }
 
-    void installOkHttp() throws Throwable {
-        // OkHttClientPool adds cg1.a (identity) followed by dg1.a (Fawkes).
-        // Intercept dg1's chain.proceed(request), after BOTH sets of headers exist.
-        Class<?> interceptor = module.load(loader, "dg1.a");
+    // OkHttClientPool adds cg1.a (identity) followed by dg1.a (Fawkes).
+    // Intercept dg1's chain.proceed(request), after BOTH sets of headers exist.
+    void registerOkHttp(MossHookHub hub) throws Throwable {
         Class<?> chainType = module.load(loader, "okhttp3.u$a");
         Class<?> requestType = module.load(loader, "okhttp3.a0");
-        Method intercept = module.declaredMethod(interceptor, "intercept", chainType);
-        Method request = module.declaredMethod(chainType, "request");
         Method proceed = module.declaredMethod(chainType, "a", requestType);
-        Method url = module.declaredMethod(requestType, "l");
         OkHttpAccess access = new OkHttpAccess(module, loader);
-        module.deoptimizeFeatureMethod(intercept);
-        module.addHook("IP location OkHttp outgoing headers", intercept, chain -> {
-            if (!module.isIpLocationEnabled()) {
-                return chain.proceed();
+        hub.addOkHttpScope(MossHookHub.PART_FAWKES, new MossHookHub.OkHttpScope() {
+            @Override
+            public boolean matches(String url) {
+                return isCommentRead.test(url);
             }
-            Object original = chain.getArg(0);
-            String address = String.valueOf(module.invoke(
-                    url, module.invoke(request, original)));
-            if (!isCommentRead.test(address)) {
-                return chain.proceed();
-            }
-            String source = "okhttp-send " + URI.create(address).getRawPath();
-            Object proxy = Proxy.newProxyInstance(loader, new Class<?>[]{chainType},
-                    (receiver, method, args) -> {
-                        if (method.equals(proceed) && module.isIpLocationEnabled()) {
-                            Object outgoing = args[0];
-                            try {
-                                OkHttpAccess.View view = access.view(outgoing);
-                                rewriter.rewrite(source, view);
-                                args[0] = view.request();
-                            } catch (Throwable error) {
-                                // A failed check keeps the complete original request.
-                                module.error("IP location OkHttp outgoing header check failed",
-                                        error);
+
+            @Override
+            public Object around(String part, String address, XposedInterface.Chain chain,
+                    Object[] args, MossHookHub.Next next) throws Throwable {
+                if (!module.isIpLocationEnabled()) {
+                    return next.proceed(args);
+                }
+                Object original = args != null && args.length > 0 ? args[0] : chain.getArg(0);
+                String source = "okhttp-send " + URI.create(address).getRawPath();
+                Object proxy = Proxy.newProxyInstance(loader, new Class<?>[]{chainType},
+                        (receiver, method, callArgs) -> {
+                            if (method.equals(proceed) && module.isIpLocationEnabled()) {
+                                Object outgoing = callArgs[0];
+                                try {
+                                    OkHttpAccess.View view = access.view(outgoing);
+                                    rewriter.rewrite(source, view);
+                                    callArgs[0] = view.request();
+                                } catch (Throwable error) {
+                                    // A failed check keeps the complete original request.
+                                    module.error(
+                                            "IP location OkHttp outgoing header check failed",
+                                            error);
+                                }
                             }
-                        }
-                        return module.invoke(method, original,
-                                args == null ? new Object[0] : args);
-                    });
-            return chain.proceed(new Object[]{proxy});
+                            return module.invoke(method, original,
+                                    callArgs == null ? new Object[0] : callArgs);
+                        });
+                return next.proceed(new Object[]{proxy});
+            }
         });
     }
 
